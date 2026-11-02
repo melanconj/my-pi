@@ -182,11 +182,11 @@ Extension that manages git worktree–based branch sessions — create a worktre
 
 ### Quota Providers
 
-Generic quota-aware provider extension. Out-of-repo provider implementations plug in through typed seams (model discovery, auth, usage, retryable-error classification). Core adds pro-rated spend backpressure so a provider's billing window isn't burned early. Implementations are loaded via jiti from a config file at `~/.pi/agent/quota-providers.json`.
+Generic quota-aware provider extension. Out-of-repo provider implementations plug in through typed seams (model discovery, auth, usage, retryable-error classification). Core adds pro-rated spend backpressure so a provider's billing window isn't burned early. Native implementations extend existing built-in providers under the same ID while preserving auth, discovery, routing, and host model overrides; both implementation forms use the same dollar quota pipeline. Modules are loaded via jiti from `~/.pi/agent/quota-providers.json`, with a package-relative `builtin:copilot` alias for portable setup.
 
-**Responsibilities:** implementation discovery and registration via config file, provider model discovery (block-once cold start, background refresh), token management via out-of-band runner, usage polling via out-of-band runner, ledger-based spend tracking (local accumulation between snapshots), provider-call-boundary soft-cap enforcement that covers user prompts, tool loops, retries, compaction, and extension-triggered turns, opt-in hard-cap enforcement, in-memory agent-tree-scoped bypass propagated to in-process subagents, opt-in retryable-error classification (`isRetryableError`) rewritten into pi's retryable error vocabulary so transient gateway failures get pi's agent-level retry, `/quota` command (status + bypass toggle), footer/statusline indicator
+**Responsibilities:** config-driven discovery and registration, provider model discovery (block-once cold start, background refresh), out-of-band token/usage polling, local dollar ledger or provider-authoritative accounting, provider-call-boundary soft pacing and opt-in hard caps, tree-scoped bypass propagated to in-process subagents, optional gateway retry classification, `/quota` status/bypass and footer, validated usage caches with shared poll locks and failure backoff, native-provider wrapping (`lib/native-provider.ts`) preserving host auth/catalog/model overrides while guarding both streaming methods
 
-**Dependencies:** Subagents' tree-scoped key/value store; uses `@earendil-works/pi-ai` for catalog metadata and the underlying API stream fallback
+**Dependencies:** Subagents' tree-scoped key/value store; uses `@earendil-works/pi-ai` for catalog metadata, memory credential storage and API stream fallback, and pi's public `ModelRuntime` for native-provider/catalog layers
 
 **Files:**
 - `extensions/quota-providers/**`
@@ -195,15 +195,16 @@ Generic quota-aware provider extension. Out-of-repo provider implementations plu
 
 ### Quota Provider Implementations
 
-Built-in quota-provider implementation modules for Azure AI Foundry and the LLM Gateway DevPass service. They are loaded through the Quota Providers extension rather than as standalone extensions.
+Built-in quota-provider implementation modules for Azure AI Foundry, the LLM Gateway DevPass service, and native GitHub Copilot. They are loaded through the Quota Providers extension rather than as standalone extensions.
 
-**Responsibilities:** Azure deployment discovery via `az`, Azure AD token acquisition, LLM Gateway catalog and usage discovery, provider-specific authentication and billing-window interpretation
+**Responsibilities:** Azure deployment discovery and AD tokens via `az`; LLM Gateway catalog, auth, and billing windows; Copilot usage via the existing GitHub OAuth login, converting AI credits at $0.01 into shared monthly dollar snapshots without catalog-cost estimates
 
 **Dependencies:** Quota Providers (typed implementation seams), Azure CLI for Foundry, provider environment variables
 
 **Files:**
 - `extensions/quota-providers/impls/foundry.ts`
 - `extensions/quota-providers/impls/devpass.ts`
+- `extensions/quota-providers/impls/copilot.ts` (and colocated tests)
 
 ### Toolscript Extension
 

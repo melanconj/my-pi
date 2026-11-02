@@ -9,11 +9,12 @@ import {
 	readFileSync,
 	existsSync,
 	rmSync,
+	utimesSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 // Paths
@@ -21,6 +22,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const RUNNER_PATH = join(__dirname, "runner.mjs");
 const FAKE_IMPL_PATH = join(__dirname, "test", "fake-impl.ts");
+const FAKE_NATIVE_IMPL_PATH = join(__dirname, "test", "fake-native-impl.ts");
 
 // Helpers
 
@@ -235,7 +237,6 @@ describe("runner.mjs — usage", () => {
 		cachePath = join(tmpDir, "usage.json");
 		ledgerPath = join(tmpDir, "ledger.jsonl");
 	});
-
 	afterEach(() => {
 		rmSync(tmpDir, { recursive: true, force: true });
 	});
@@ -245,60 +246,117 @@ describe("runner.mjs — usage", () => {
 		quota: 100,
 		windowStart: Date.now() - 86_400_000,
 		windowEnd: Date.now() + 86_400_000,
-		asOf: Date.now() - 5_000, // authoritative up to 5 s ago
+		asOf: Date.now() - 5_000,
 	};
-
-	function runUsage(maxPollSeconds = 300): RunResult {
-		return runRunner([
-			"usage",
-			"--module", FAKE_IMPL_PATH,
-			"--impl", "fake",
-			"--config", configPath,
-			"--cache", cachePath,
-			"--ledger", ledgerPath,
-			"--max-poll-seconds", String(maxPollSeconds),
-		]);
+	function usageArgs(modulePath = FAKE_IMPL_PATH): string[] {
+		return [
+			"usage", "--module", modulePath, "--impl", "fake", "--config", configPath,
+			"--cache", cachePath, "--ledger", ledgerPath, "--max-poll-seconds", "300",
+		];
+	}
+	function runUsage(modulePath = FAKE_IMPL_PATH): RunResult {
+		return runRunner(usageArgs(modulePath));
 	}
 
 	it("writes snapshot to cache and prunes ledger entries <= asOf, keeping later ones", () => {
 		writeConfig(configPath, { usage: snapshot });
-
-		// Write a ledger with one old entry (before asOf) and one new one (after asOf).
 		const oldEntry = JSON.stringify({ timestamp: snapshot.asOf - 1_000, cost: 0.05 });
 		const newEntry = JSON.stringify({ timestamp: snapshot.asOf + 1_000, cost: 0.07 });
 		writeFileSync(ledgerPath, `${oldEntry}\n${newEntry}\n`, "utf-8");
 
-		const result = runUsage();
-		expect(result.status).toBe(0);
-
-		// Cache written.
-		expect(existsSync(cachePath)).toBe(true);
+		expect(runUsage().status).toBe(0);
 		const written = JSON.parse(readFileSync(cachePath, "utf-8"));
 		expect(typeof written.writtenAt).toBe("number");
-		expect(written.snapshot).toMatchObject({ spend: snapshot.spend, quota: snapshot.quota });
-
-		// Old ledger entry pruned; new entry kept.
+		expect(written.snapshot).toEqual(snapshot);
 		const ledger = readFileSync(ledgerPath, "utf-8");
 		expect(ledger).not.toContain(oldEntry);
 		expect(ledger).toContain(newEntry);
 	});
 
-	it("second immediate usage run exits 0 without rewriting (stampede guard)", () => {
+	it("second immediate usage run exits 0 without rewriting", () => {
 		writeConfig(configPath, { usage: snapshot });
+		expect(runUsage().status).toBe(0);
+		const first = readFileSync(cachePath, "utf-8");
+		expect(runUsage().status).toBe(0);
+		expect(readFileSync(cachePath, "utf-8")).toBe(first);
+	});
 
-		// First run — writes cache.
-		const first = runUsage();
-		expect(first.status).toBe(0);
+	it("uses native usage without token/discovery seams and caches only projected billing fields", () => {
+		writeConfig(configPath, { usage: [{ ...snapshot, token: "never-cache-me" }] });
+		const result = runUsage(FAKE_NATIVE_IMPL_PATH);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout + result.stderr).toBe("");
+		const output = readFileSync(cachePath, "utf-8");
+		expect(JSON.parse(output).snapshots).toEqual([snapshot]);
+		expect(output).not.toContain("never-cache-me");
+		expect(existsSync(join(tmpDir, "token.json"))).toBe(false);
+		expect(existsSync(`${cachePath}.lock`)).toBe(false);
+	});
+
+	it.each([
+		["native", undefined, false],
+		["native", "ledger", true],
+		["managed", "provider", false],
+	] as const)("uses %s accounting=%s when pruning the ledger", (kind, accounting, prunesLedger) => {
+		let modulePath = kind === "native" ? FAKE_NATIVE_IMPL_PATH : FAKE_IMPL_PATH;
+		if (accounting) {
+			const overridePath = join(tmpDir, "accounting.ts");
+			writeFileSync(overridePath, `import impl from ${JSON.stringify(pathToFileURL(modulePath).href)}; export default { ...impl, accounting: ${JSON.stringify(accounting)} };`);
+			modulePath = overridePath;
+		}
+		writeConfig(configPath, { usage: snapshot });
+		const ledger = JSON.stringify({ timestamp: snapshot.asOf - 1, cost: 999 }) + "\n";
+		writeFileSync(ledgerPath, ledger);
+		expect(runUsage(modulePath).status).toBe(0);
+		expect(readFileSync(ledgerPath, "utf-8")).toBe(prunesLedger ? "" : ledger);
+	});
+
+	it("preserves successful snapshots, sanitizes failure, and backs off before retrying", () => {
+		const counterFile = join(tmpDir, "usage-counter.txt");
+		writeConfig(configPath, { usage: snapshot, usageCounterFile: counterFile });
+		expect(runUsage(FAKE_NATIVE_IMPL_PATH).status).toBe(0);
+		const prior = JSON.parse(readFileSync(cachePath, "utf-8"));
+		prior.writtenAt = Date.now() - 301_000;
+		prior.attemptedAt = prior.writtenAt;
+		writeFileSync(cachePath, JSON.stringify(prior));
+		writeConfig(configPath, { failSeams: ["usage"], usageErrorCode: "rate-limited", usageCounterFile: counterFile });
+		const result = runUsage(FAKE_NATIVE_IMPL_PATH);
+		expect(result.status).not.toBe(0);
+		const output = readFileSync(cachePath, "utf-8");
+		expect(result.stdout + result.stderr + output).not.toContain("do-not-log");
+		expect(JSON.parse(output)).toMatchObject({ error: "rate-limited", snapshots: [snapshot] });
+		expect(runUsage(FAKE_NATIVE_IMPL_PATH).status).toBe(0);
+		expect(readFileSync(counterFile, "utf-8").trim().split("\n")).toHaveLength(2);
+		expect(existsSync(`${cachePath}.lock`)).toBe(false);
+	});
+
+	it("rejects malformed snapshots instead of marking them fresh", () => {
+		writeConfig(configPath, { usage: [{ ...snapshot, quota: null }] });
+		expect(runUsage(FAKE_NATIVE_IMPL_PATH).status).not.toBe(0);
+		expect(JSON.parse(readFileSync(cachePath, "utf-8"))).toMatchObject({ error: "invalid-response", snapshots: [] });
+	});
+
+	it("skips a live usage lock and steals a stale one", () => {
+		writeConfig(configPath, { usage: snapshot });
+		writeFileSync(`${cachePath}.lock`, "live");
+		expect(runUsage().status).toBe(0);
+		expect(existsSync(cachePath)).toBe(false);
+		const stale = new Date(Date.now() - 61_000);
+		utimesSync(`${cachePath}.lock`, stale, stale);
+		expect(runUsage().status).toBe(0);
 		expect(existsSync(cachePath)).toBe(true);
+		expect(existsSync(`${cachePath}.lock`)).toBe(false);
+	});
 
-		const firstWrittenAt = JSON.parse(readFileSync(cachePath, "utf-8")).writtenAt as number;
-
-		// Second run immediately — cache is fresh, should exit 0 without rewriting.
-		const second = runUsage(300);
-		expect(second.status).toBe(0);
-
-		const secondWrittenAt = JSON.parse(readFileSync(cachePath, "utf-8")).writtenAt as number;
-		// writtenAt must be unchanged — the second run did not rewrite.
-		expect(secondWrittenAt).toBe(firstWrittenAt);
+	it("deduplicates concurrent workers under the usage lock", async () => {
+		const counterFile = join(tmpDir, "usage-counter.txt");
+		writeConfig(configPath, { usage: snapshot, usageDelayMs: 150, usageCounterFile: counterFile });
+		const invoke = () => new Promise<number | null>((resolve, reject) => {
+			const child = spawn(process.execPath, [RUNNER_PATH, ...usageArgs()], { stdio: "ignore", timeout: 20_000 });
+			child.on("error", reject);
+			child.on("close", resolve);
+		});
+		expect(await Promise.all([invoke(), invoke()])).toEqual([0, 0]);
+		expect(readFileSync(counterFile, "utf-8").trim().split("\n")).toHaveLength(1);
 	});
 });

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { QuotaPolicy } from "./types.js";
 
 // Policy keys — reserved in each provider config block.
@@ -83,7 +84,15 @@ export function parseProvidersConfig(
 			continue;
 		}
 
-		const modulePath = expandHome(entry.module);
+		let modulePath: string;
+		if (entry.module === "builtin:copilot") {
+			modulePath = fileURLToPath(new URL("../impls/copilot.ts", import.meta.url));
+		} else if (entry.module.startsWith("builtin:")) {
+			warnings.push(`quota-providers: unknown built-in module "${entry.module}" — skipping`);
+			continue;
+		} else {
+			modulePath = expandHome(entry.module);
+		}
 
 		const enabled = entry.enabled !== false;
 
@@ -93,11 +102,11 @@ export function parseProvidersConfig(
 					? entry.bypassAllowed
 					: POLICY_DEFAULTS.bypassAllowed,
 			lookaheadHours:
-				typeof entry.lookaheadHours === "number"
+				typeof entry.lookaheadHours === "number" && Number.isFinite(entry.lookaheadHours) && entry.lookaheadHours >= 0
 					? entry.lookaheadHours
 					: POLICY_DEFAULTS.lookaheadHours,
 			maxPollSeconds:
-				typeof entry.maxPollSeconds === "number"
+				typeof entry.maxPollSeconds === "number" && Number.isFinite(entry.maxPollSeconds) && entry.maxPollSeconds >= 1
 					? entry.maxPollSeconds
 					: POLICY_DEFAULTS.maxPollSeconds,
 			enforceHardCap:

@@ -4,12 +4,24 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 // Out-of-repo implementations import only via `import type` so there is no
 // runtime path coupling to this repo.
 
-/** Default export of an implementation module. */
-export interface ProviderImplementation {
-  /** Provider id prefix, e.g. "azure-foundry". Also the cache-dir key. */
+/** Shared quota seams for managed gateways and existing native providers. */
+export interface QuotaImplementation {
   id: string;
-  /** Display name for registered providers. */
   name?: string;
+  /** Catalog costs may differ from billing. Default: ledger for gateways, provider for native. */
+  accounting?: "ledger" | "provider";
+  /** Report authoritative dollar windows. Absent means no quota enforcement. */
+  getUsage?(ctx: ImplContext): Promise<UsageSnapshot | UsageSnapshot[]>;
+}
+
+/** Preserve a built-in native provider's auth, discovery, and transport. */
+export interface NativeProviderImplementation extends QuotaImplementation {
+  nativeProviderId: string;
+  getUsage(ctx: ImplContext): Promise<UsageSnapshot | UsageSnapshot[]>;
+}
+
+/** Default export for an implementation that owns model discovery and auth. */
+export interface ProviderImplementation extends QuotaImplementation {
   /** Base endpoint, e.g. "https://x.services.ai.azure.com". */
   baseUrl: string;
   /** Whether pi should add `Authorization: Bearer <token>`. May vary per model via ModelEntry. */
@@ -23,18 +35,12 @@ export interface ProviderImplementation {
   discoverModels(ctx: ImplContext): Promise<ModelEntry[]>;
   /** Seam 2: fetch a fresh token. Runs out-of-band in the runner; core owns caching/margins. */
   getToken(ctx: ImplContext): Promise<TokenResult>;
-  /** Seam 3 (optional): report one or more quota limits. Absent → no quota enforcement. */
-  getUsage?(ctx: ImplContext): Promise<UsageSnapshot | UsageSnapshot[]>;
 
   /**
-   * Seam 4 (optional): classify a terminal provider error message as transient
-   * and worth retrying. Runs in-process on the request hot path — keep it cheap
-   * and never throw (a throw is treated as "not retryable").
-   *
-   * When it returns true, the core rewrites the message so pi's agent-level
-   * retry treats the failure as retryable and applies `settings.retry`
-   * budget/backoff. When absent, pi's own error-text classification applies
-   * unchanged.
+   * Classify a terminal provider error as transient and worth retrying.
+   * Runs on the request hot path: keep it cheap and never throw.
+   * Matching errors are rewritten into pi's retryable vocabulary and use
+   * settings.retry backoff. Absent leaves pi's classification unchanged.
    */
   isRetryableError?: (message: string) => boolean;
 }
@@ -128,10 +134,9 @@ export interface ImplContext {
    * Optional cancellation signal for the current operation. Seams that perform
    * blocking I/O (`discoverModels`, `getToken`, `getUsage`) should observe it
    * — bail on `signal?.aborted` and pass it to async underpinnings when
-   * possible — so long-running work can be cancelled by the caller. Supplied by
-   * in-process callers (e.g. a `refreshModels` backfed from Pi's refresh cycle,
-   * which forwards its own `AbortSignal`). Absent for detached/proc
-   * invocations that are bounded by their own timeouts.
+   * possible — so long-running work can be cancelled by the caller.
+   * In-process callers may forward their operation signal; the usage worker
+   * supplies a timeout signal. Other runner commands may omit it.
    */
   signal?: AbortSignal;
 }
