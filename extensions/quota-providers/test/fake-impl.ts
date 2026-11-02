@@ -8,7 +8,7 @@
  */
 
 import type { ProviderImplementation, ModelEntry, TokenResult, UsageSnapshot, ImplContext } from "../lib/types.js";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 function failSeamsIncludes(ctx: ImplContext, seam: string): boolean {
 	const list = ctx.settings.failSeams;
@@ -51,18 +51,11 @@ const fakeImpl: ProviderImplementation = {
 		return { token: "fake-token", expiresAt: Date.now() + ttl };
 	},
 
-	async getUsage(ctx: ImplContext): Promise<UsageSnapshot | UsageSnapshot[]> {
-		if (typeof ctx.settings.usageCounterFile === "string") {
-			appendFileSync(ctx.settings.usageCounterFile, "call\n");
-		}
-		const delayMs = ctx.settings.usageDelayMs;
-		if (typeof delayMs === "number") {
-			await new Promise(resolve => setTimeout(resolve, delayMs));
-		}
+	async getUsage(ctx: ImplContext): Promise<UsageSnapshot> {
 		if (failSeamsIncludes(ctx, "usage") || !ctx.settings.usage) {
-			throw Object.assign(new Error("fake: usage failure (credential=do-not-log)"), { code: ctx.settings.usageErrorCode });
+			throw new Error("fake: getUsage seam failure (failSeams includes 'usage' or usage absent)");
 		}
-		return ctx.settings.usage as UsageSnapshot | UsageSnapshot[];
+		return ctx.settings.usage as UsageSnapshot;
 	},
 };
 

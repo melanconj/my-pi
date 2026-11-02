@@ -1,9 +1,11 @@
 /**
  * Quota-aware Provider Extension
  *
- * Loads managed gateways and native-provider integrations from quota-providers.json.
- * Both use the same usage snapshots, budget policy, request guards, and bypass.
- * Gateway discovery/token acquisition and shared usage polling run out of process.
+ * Registers provider implementations declared in ~/.pi/agent/quota-providers.json.
+ * Each implementation is an out-of-repo TypeScript module that satisfies
+ * ProviderImplementation (lib/types.ts). Discovery and token fetch are delegated
+ * to the out-of-band runner (runner.mjs) so neither blocks the extension-factory
+ * path.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -14,18 +16,18 @@ import type { Provider } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { loadProvidersConfig, cachePaths, resolveAgentDir } from "./lib/config.js";
 import type { CachePaths } from "./lib/config.js";
-import { createGuardedNativeProvider } from "./lib/native-provider.js";
 import {
 	readModelsCache,
 	groupModels,
 	buildProviderConfig,
+	buildExistingProvider,
 	discoveryRefreshDue,
 } from "./lib/registration.js";
 import { guardStreamSimple, type ProviderStreamSimple } from "./lib/stream-guard.js";
 import { mapRetryableErrors } from "./lib/retryable-errors.js";
-import type { NativeProviderImplementation, ProviderImplementation, QuotaPolicy } from "./lib/types.js";
+import type { ProviderImplementation, QuotaPolicy } from "./lib/types.js";
 import { appendLedgerEntry, readLedger } from "./lib/ledger.js";
-import { readUsageSnapshot, usageErrorText, usageRefreshDue } from "./lib/snapshot.js";
+import { readUsageSnapshot } from "./lib/snapshot.js";
 import { readBypass, writeBypass, resolveRequestStore } from "./lib/bypass.js";
 import { evaluateQuota, effectiveSpend, applicableSnapshots, firstHitSnapshot } from "./lib/quota.js";
 import {
@@ -37,8 +39,9 @@ import type { SessionTreeStore } from "../../lib/session-tree-store.js";
 import { decideBlock } from "./lib/enforce.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+// Module-level state — init-then-freeze; consumed by Steps 10–13.
+
 export interface ProviderRecord {
-	accounting?: "ledger" | "provider";
 	id: string;
 	implPath: string;
 	configPath: string;
@@ -49,7 +52,7 @@ export interface ProviderRecord {
 	modelLimitIds: ReadonlyMap<string, string[]>;
 }
 
-type QuotaRecordFacts = Pick<ProviderRecord, "paths" | "policy" | "hasUsageSeam" | "modelLimitIds" | "accounting">;
+type QuotaRecordFacts = Pick<ProviderRecord, "paths" | "policy" | "hasUsageSeam" | "modelLimitIds">;
 
 /**
  * Evaluate every active limit that applies to the selected model. Returning
@@ -70,7 +73,7 @@ function evaluateProviderQuota(
 		.sort((a, b) => a.windowEnd - b.windowEnd);
 	if (snapshots.length === 0) return undefined;
 
-	const ledger = record.accounting === "provider" ? [] : readLedger(record.paths.ledger);
+	const ledger = readLedger(record.paths.ledger);
 	const bypassActive = record.policy.bypassAllowed && store ? readBypass(store) : false;
 	const decisions = snapshots.map((snapshot) => {
 		const decision = decideBlock({
@@ -112,7 +115,8 @@ function formatDaysAhead(days: number): string {
  * there is nothing worth showing. Scoped to the active model's keys and
  * rendered for the single scope it will hit first — least remaining headroom,
  * ties to the latest reset. The tier name is omitted to keep the line short on
- * mobile layouts; expired windows show a refresh state instead of an old budget.
+ * mobile layouts; expired windows are omitted until a background poll replaces
+ * them.
  */
 function buildFooterLine(
 	record: ProviderRecord,
@@ -122,16 +126,12 @@ function buildFooterLine(
 ): string | undefined {
 	if (!record.hasUsageSeam) return undefined;
 	const cached = readUsageSnapshot(record.paths.usage);
-	if (!cached) return "quota: fetching usage…";
-	const ledger = record.accounting === "provider" ? [] : readLedger(record.paths.ledger);
+	if (!cached) return undefined;
+	const ledger = readLedger(record.paths.ledger);
 	const bypassActive = record.policy.bypassAllowed && readBypass(store);
 	const limitIds = modelId ? record.modelLimitIds.get(modelId) ?? [] : [];
 	const snapshot = firstHitSnapshot(cached.snapshots, limitIds, ledger, now);
-	if (!snapshot) {
-		if (cached.error) return `quota: ${usageErrorText(cached.error)}`;
-		if (cached.snapshots.length === 0) return `quota: no finite cap${bypassActive ? " · bypassed" : ""}`;
-		return "quota: refreshing usage…";
-	}
+	if (!snapshot) return undefined;
 
 	const verdict = evaluateQuota(snapshot, ledger, record.policy, now);
 	const spend = effectiveSpend(snapshot, ledger);
@@ -143,8 +143,6 @@ function buildFooterLine(
 	if (verdict.state === "hard-exceeded") suffix = " · HARD CAP";
 	else if (bypassActive) suffix = " · bypassed";
 	else if (verdict.state === "soft-exceeded") suffix = " · soft cap";
-	if (cached.error) suffix += ` · stale: ${usageErrorText(cached.error)}`;
-	else if (now - cached.writtenAt > record.policy.maxPollSeconds * 2000 || now - snapshot.asOf > Math.max(900_000, record.policy.maxPollSeconds * 2000)) suffix += " · stale";
 
 	return `quota: ${formatDollars(spend)}/${formatDollars(snapshot.quota)} ${delta}→${resetDate}${suffix}`;
 }
@@ -166,11 +164,10 @@ export function refreshStatusline(
 
 // Helpers
 
-/** Fire-and-forget background runner; never blocks, never throws. */
+/** Fire-and-forget background discover; never blocks, never throws. */
 function spawnRefreshDetached(args: string[]): void {
 	try {
-		const child = spawn(process.execPath, args, { detached: true, stdio: "ignore", timeout: 35_000 });
-		child.on("error", () => {});
+		const child = spawn(process.execPath, args, { detached: true, stdio: "ignore" });
 		child.unref();
 	} catch {
 		// best-effort
@@ -178,13 +175,10 @@ function spawnRefreshDetached(args: string[]): void {
 }
 
 /** Load an implementation module via jiti (same mechanism as runner.mjs). */
-async function loadImpl(modulePath: string): Promise<ProviderImplementation | NativeProviderImplementation> {
+async function loadImpl(modulePath: string): Promise<ProviderImplementation> {
 	const { createJiti } = await import("jiti");
-	const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
-	const loaded = await jiti.import(modulePath) as { default?: ProviderImplementation | NativeProviderImplementation } | null;
-	const impl = loaded?.default ?? loaded;
-	if (!impl || typeof impl !== "object" || Array.isArray(impl)) throw new Error("Implementation must export an object");
-	return impl as ProviderImplementation | NativeProviderImplementation;
+	const jiti = createJiti(import.meta.url, { interopDefault: true });
+	return jiti.import(modulePath) as Promise<ProviderImplementation>;
 }
 
 // Extension Entry Point
@@ -207,12 +201,14 @@ export default async function (pi: ExtensionAPI) {
 	const runnerPath = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 	const now = Date.now();
 
-	// Indexed session IDs resolve child requests to their tree. Compaction may
-	// use a synthetic ID, so keep the owning root's store as a fallback.
-	// Native registration assumes a session-owned model runtime.
+	// The provider stream guard resolves the bypass store per request from
+	// `options.sessionId` (the only identity at the provider boundary — closures
+	// here can serve other sessions because the model runtime is shared within a
+	// host process). This captured store is the fallback for requests that carry
+	// no session id; it is set during session_start/agent_start.
 	let treeStore: SessionTreeStore | undefined;
 	const records: ProviderRecord[] = [];
-	const ownedNativeProviders = new Map<string, Provider>();
+	const existingProviders = new Map<string, Provider>();
 
 	for (const resolved of providers) {
 		if (!resolved.enabled) continue;
@@ -225,40 +221,56 @@ export default async function (pi: ExtensionAPI) {
 		// this is intentionally redundant: the factory needs the metadata synchronously
 		// to call buildProviderConfig, and keeping impl loading out of the runner's
 		// responsibility keeps both sides simple.
-		let loaded: ProviderImplementation | NativeProviderImplementation;
+		let impl: ProviderImplementation;
 		try {
-			loaded = await loadImpl(implPath);
+			impl = await loadImpl(implPath);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			console.warn(`quota-providers: skipping "${id}" — failed to load impl module: ${msg}`);
 			continue;
 		}
 
-		if ("nativeProviderId" in loaded) {
-			const nativeId = loaded.nativeProviderId;
-			if (!nativeId || typeof loaded.getUsage !== "function" || ownedNativeProviders.has(nativeId)) {
-				console.warn(`quota-providers: skipping "${id}" — invalid or duplicate native quota provider`);
+		if (!impl.discoverModels) {
+			if (!impl.getUsage || existingProviders.has(impl.id)) {
+				console.warn(`quota-providers: skipping "${id}" — usage-only providers require getUsage and a unique provider id`);
 				continue;
 			}
 			const record: ProviderRecord = Object.freeze({
-				id, implPath, configPath, paths, policy, hasUsageSeam: true,
-				accounting: loaded.accounting ?? "provider",
-				providerIds: [nativeId], modelLimitIds: new Map<string, string[]>(),
+				id,
+				implPath,
+				configPath,
+				paths,
+				policy,
+				hasUsageSeam: true,
+				providerIds: [impl.id],
+				modelLimitIds: new Map<string, string[]>(),
 			});
 			try {
-				const provider = await createGuardedNativeProvider(nativeId, (model, options) => {
-					maybeRefreshUsage(record);
-					return evaluateProviderQuota(record, resolveRequestStore(options?.sessionId, treeStore), Date.now(), model.id);
+				const provider = await buildExistingProvider(impl.id, (stream) => {
+					const gated = guardStreamSimple(stream, (model, options) => {
+						maybeRefreshUsage(record);
+						return evaluateProviderQuota(
+							record,
+							resolveRequestStore(options?.sessionId, treeStore),
+							Date.now(),
+							model.id,
+						);
+					});
+					return impl.isRetryableError ? mapRetryableErrors(gated, impl.isRetryableError) : gated;
 				});
 				pi.registerProvider(provider);
-				ownedNativeProviders.set(nativeId, provider);
+				existingProviders.set(impl.id, provider);
 				records.push(record);
-			} catch {
-				console.warn(`quota-providers: skipping "${id}" — native provider registration failed`);
+			} catch (err) {
+				console.warn(`quota-providers: skipping "${id}" — ${err instanceof Error ? err.message : String(err)}`);
 			}
 			continue;
 		}
-		const impl = loaded as ProviderImplementation;
+		if (typeof impl.baseUrl !== "string" || !impl.getToken) {
+			console.warn(`quota-providers: skipping "${id}" — discovered models require baseUrl and getToken`);
+			continue;
+		}
+
 		let cache = readModelsCache(paths.models);
 
 		if (!cache) {
@@ -358,7 +370,7 @@ export default async function (pi: ExtensionAPI) {
 					? guardStreamSimple(apiStreamSimple, (model, options) => {
 							if (providerRecord) maybeRefreshUsage(providerRecord);
 							return evaluateProviderQuota(
-								{ paths, policy, hasUsageSeam, modelLimitIds, accounting: impl.accounting },
+								{ paths, policy, hasUsageSeam, modelLimitIds },
 								resolveRequestStore(options?.sessionId, treeStore),
 								Date.now(),
 								model.id,
@@ -383,7 +395,6 @@ export default async function (pi: ExtensionAPI) {
 			paths,
 			policy,
 			hasUsageSeam,
-			accounting: impl.accounting ?? "ledger",
 			providerIds,
 			modelLimitIds,
 		});
@@ -400,15 +411,30 @@ export default async function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** Shared cache workers outlive the session that requested a refresh. */
+	/** Kick a detached usage-poll if cache is stale; best-effort. */
 	function maybeRefreshUsage(record: ProviderRecord): void {
 		if (!record.hasUsageSeam) return;
-		if (!usageRefreshDue(readUsageSnapshot(record.paths.usage), record.policy.maxPollSeconds)) return;
-		spawnRefreshDetached([
-			runnerPath, "usage", "--module", record.implPath, "--impl", record.id,
-			"--config", record.configPath, "--cache", record.paths.usage,
-			"--ledger", record.paths.ledger, "--max-poll-seconds", String(record.policy.maxPollSeconds),
-		]);
+		const cached = readUsageSnapshot(record.paths.usage);
+		const now = Date.now();
+		// Force a refresh when any cached limit window has already reset, regardless
+		// of snapshot age — stale windows must not linger below the poll floor.
+		const windowEnded = cached
+			? cached.snapshots.some((snapshot) => now >= snapshot.windowEnd)
+			: false;
+		const age = cached ? (now - cached.writtenAt) / 1000 : Infinity;
+		if (!windowEnded && age < record.policy.maxPollSeconds) return;
+		try {
+			const child = spawn(process.execPath, [
+				runnerPath, "usage",
+				"--module", record.implPath,
+				"--impl", record.id,
+				"--config", configPath,
+				"--cache", record.paths.usage,
+				"--ledger", record.paths.ledger,
+				"--max-poll-seconds", String(record.policy.maxPollSeconds),
+			], { detached: true, stdio: "ignore" });
+			child.unref();
+		} catch { /* best-effort */ }
 	}
 
 	// The store is owned by the current root's AgentSessionRegistry. The
@@ -447,15 +473,12 @@ export default async function (pi: ExtensionAPI) {
 	// Drop the session-id index entry when this session goes away; the tree
 	// store itself is owned and disposed by the subagents extension.
 	pi.on("session_shutdown", (_event, ctx) => {
-		for (const [id, provider] of ownedNativeProviders) {
-			try {
-				if (ctx.modelRegistry.getRegisteredNativeProvider(id) === provider) pi.unregisterProvider(id);
-			} catch { /* an already-disposed host has no live registration to restore */ }
+		for (const [id, provider] of existingProviders) {
+			if (ctx.modelRegistry.getRegisteredNativeProvider(id) === provider) pi.unregisterProvider(id);
 		}
-		ownedNativeProviders.clear();
+		existingProviders.clear();
 		const sessionId = sessionIdOf(ctx.sessionManager);
 		if (sessionId) unregisterSessionIdTreeStore(sessionId, treeStore);
-		treeStore = undefined;
 	});
 
 	// Retarget the footer to the newly-selected model's provider (or clear it when
@@ -471,18 +494,16 @@ export default async function (pi: ExtensionAPI) {
 		if (event.message.role !== "assistant") return;
 		const record = providerIdToRecord.get(event.message.provider ?? "");
 		if (!record) return;
-		if (record.accounting !== "provider") {
-			const quotaLimitIds = record.modelLimitIds.get(event.message.model);
-			appendLedgerEntry(
-				record.paths.ledger,
-				{
-					timestamp: event.message.timestamp,
-					cost: event.message.usage?.cost?.total ?? 0,
-					...(quotaLimitIds ? { quotaLimitIds } : {}),
-				},
-				`${record.paths.ledger}.lock`, // hold the ledger lock so cmdUsage prune can't clobber us
-			);
-		}
+		const quotaLimitIds = record.modelLimitIds.get(event.message.model);
+		appendLedgerEntry(
+			record.paths.ledger,
+			{
+				timestamp: event.message.timestamp,
+				cost: event.message.usage?.cost?.total ?? 0,
+				...(quotaLimitIds ? { quotaLimitIds } : {}),
+			},
+			`${record.paths.ledger}.lock`, // hold the ledger lock so cmdUsage prune can't clobber us
+		);
 		maybeRefreshUsage(record);
 		refreshStatusline(providerIdToRecord.get(ctx.model?.provider ?? ""), ctx);
 	});
@@ -497,7 +518,8 @@ export default async function (pi: ExtensionAPI) {
 	// This handler only refreshes usage and the status line before the run.
 	pi.on("input", (event, ctx) => {
 		const record = providerIdToRecord.get(ctx.model?.provider ?? "");
-		if (record?.hasUsageSeam) maybeRefreshUsage(record);
+		if (!record || !record.hasUsageSeam) return;
+		maybeRefreshUsage(record);
 		refreshStatusline(record, ctx);
 	});
 

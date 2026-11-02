@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore, type Api, type Model, type Provider } from "@earendil-works/pi-ai";
+import { ModelRuntime, type ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import type { ModelEntry, ModelMetadataOverrides } from "./types.js";
 
@@ -193,6 +193,21 @@ export function buildProviderConfig(
 			};
 		}),
 	};
+}
+
+export async function buildExistingProvider(
+	id: string,
+	wrapStream: (stream: Provider["streamSimple"]) => Provider["streamSimple"],
+): Promise<Provider> {
+	// Let the real runtime apply its model overrides above this provider.
+	const runtime = await ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		refreshOnCreate: false,
+	});
+	const provider = runtime.getProvider(id);
+	if (!provider) throw new Error(`Unknown pi provider: ${id}`);
+	return { ...provider, streamSimple: wrapStream(provider.streamSimple.bind(provider)) };
 }
 
 // Discovery cache

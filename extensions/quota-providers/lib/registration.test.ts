@@ -4,11 +4,28 @@ import {
 	REFRESH_FLOOR_MS,
 	REFRESH_TTL_MS,
 	buildProviderConfig,
+	buildExistingProvider,
 	discoveryRefreshDue,
 	groupModels,
 	readModelsCache,
 	resolveModelMeta,
 } from "./registration.js";
+
+describe("buildExistingProvider", () => {
+	it("keeps pi's authentication and catalog while replacing only the stream wrapper", async () => {
+		const stream = vi.fn();
+		const provider = await buildExistingProvider("github-copilot", () => stream);
+		expect(provider.id).toBe("github-copilot");
+		expect(provider.auth.oauth).toBeDefined();
+		expect(provider.getModels().length).toBeGreaterThan(0);
+		expect(provider.refreshModels).toBeTypeOf("function");
+		expect(provider.streamSimple).toBe(stream);
+	});
+
+	it("rejects an unknown pi provider", async () => {
+		await expect(buildExistingProvider("missing-provider", (stream) => stream)).rejects.toThrow("Unknown pi provider");
+	});
+});
 
 // groupModels
 

@@ -129,24 +129,6 @@ describe("parseProvidersConfig", () => {
 		expect(warnings).toHaveLength(1);
 	});
 
-	it("resolves the portable Copilot alias relative to the installed package", () => {
-		const { providers, warnings } = parseProvidersConfig(makeRaw({ copilot: { module: "builtin:copilot" } }), noExpand);
-		expect(warnings).toEqual([]);
-		expect(providers[0].modulePath.endsWith(path.join("quota-providers", "impls", "copilot.ts"))).toBe(true);
-		expect(fs.existsSync(providers[0].modulePath)).toBe(true);
-	});
-
-	it("rejects unknown built-ins and defaults unsafe polling/pacing settings", () => {
-		const { providers, warnings } = parseProvidersConfig(makeRaw({
-			unknown: { module: "builtin:unknown" },
-			copilot: { module: "builtin:copilot", maxPollSeconds: -1, lookaheadHours: -1 },
-		}), noExpand);
-		expect(warnings).toHaveLength(1);
-		expect(providers).toHaveLength(1);
-		expect(providers[0].policy.maxPollSeconds).toBe(300);
-		expect(providers[0].policy.lookaheadHours).toBe(6);
-	});
-
 	it("respects enabled:false", () => {
 		const raw = makeRaw({ myProvider: { module: "/impl.ts", enabled: false } });
 		const { providers } = parseProvidersConfig(raw, noExpand);

@@ -125,17 +125,6 @@ Core policy fields:
 - `maxPollSeconds` defaults to `300`.
 - `enforceHardCap` defaults to `false`.
 
-Use `/quota` for status and `/quota bypass on|off` (or `/quota bypass` to toggle)
-to override soft pacing within the current agent tree. An enforced hard cap is
-never bypassable, even if the service permits paid overage. Bypass does not
-persist across restarts.
-
-Session activity and provider requests trigger asynchronous usage refreshes,
-respecting `maxPollSeconds`. The next activity updates the footer. Decisions use the
-latest valid active snapshot; without one, no local quota block is applied.
-Refresh failures retain the previous snapshot, show a stale/error status, and
-back off before retrying. Expired windows are not enforced.
-
 Malformed JSON and malformed provider entries are skipped with warnings. A
 missing file means no providers. Set `PI_CODING_AGENT_DIR` to move this file
 and its cache. The extension stores provider state under
@@ -160,65 +149,10 @@ The repository includes implementation modules under
 - `LLMGATEWAY_API_KEY` is required.
 - `billingCycleAnchor` is an ISO-8601 UTC timestamp, or a `$ENV_VAR` reference.
 
-### GitHub Copilot
+**GitHub Copilot** uses the current pi Copilot login; no additional credentials are required.
 
-Copilot extends pi's built-in `github-copilot` provider, preserving its login,
-catalog, routing, and `models.json` overrides. It uses the same quota evaluation,
-pacing, hard-cap policy, statusline, and tree-scoped bypass as the other providers.
-Requires pi 1.4 or newer.
-
-Enable `extensions/quota-providers/index.ts` in the my-pi package's extension
-filter (`pi config`), then add this entry to `~/.pi/agent/quota-providers.json`:
-
-```json
-{
-  "providers": {
-    "copilot": {
-      "module": "builtin:copilot"
-    }
-  }
-}
-```
-
-The built-in alias resolves within the installed package; no checkout-specific
-path or additional dependency is needed. Each user signs in normally through
-`/login` → GitHub Copilot. Reload pi or start a new session, select a Copilot
-model, and run `/quota`.
-
-Usage is converted at **1 AI credit = $0.01**, using entitlement and its
-compatible remaining balance (percentage is a fallback). The provider reports
-UTC calendar-month windows. Retail model prices are not guaranteed to match
-Copilot charges, so only authoritative usage snapshots count toward this budget.
-Polling and backend reporting can lag; this is not per-request reservation.
-
-The quota GET reads the current stored GitHub OAuth credential without refreshing
-or writing it. No PAT or separate API key is needed. Optional `authPath` selects
-another pi `auth.json` file (supports `~/`); arbitrary custom/in-memory SDK
-credential stores are not discovered automatically. Credentials and raw account
-responses are never cached.
-
-Supported: AI-credit billing with calendar-month windows. Explicit unlimited
-allowances have no finite cap. Legacy premium-request billing, Enterprise
-logins, and non-calendar windows are rejected rather than assigned invented
-dollar budgets. The internal GitHub quota endpoint is not a stable public API.
-
-The guard covers both streaming methods for native Copilot APIs; unrelated APIs
-added through custom `models.json` entries are unsupported. Each quota-owning
-session needs its own model runtime, as used by standard my-pi roots and children;
-sharing a runtime between separately loaded quota extension instances is unsupported.
-
-### Provider implementation seams
-
-Managed gateways implement `ProviderImplementation` in
-`extensions/quota-providers/lib/types.ts`. Built-in native integrations implement
-`NativeProviderImplementation`, declaring `nativeProviderId` and the same
-`getUsage(ctx)` seam. Both use the shared usage runner/cache, dollar snapshots,
-policies, and bypass store. Native registration keeps authentication and catalog
-refresh delegated to pi.
-
-Implementation-level `accounting: "provider"` excludes local model-cost ledger
-estimates. Native implementations default to this mode; managed gateways default
-to `"ledger"`. Use ledger accounting only when local costs match provider billing.
+Provider implementations are code. Follow the seam types in
+`extensions/quota-providers/lib/types.ts` when writing one outside this repo.
 
 ## Toolscript
 

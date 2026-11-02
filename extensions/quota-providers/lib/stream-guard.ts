@@ -1,4 +1,3 @@
-import type { Api, Model, StreamFunction, StreamOptions } from "@earendil-works/pi-ai";
 import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
 
 /** The result of evaluating quota immediately before a provider request. */
@@ -20,20 +19,13 @@ type StreamArgs = Parameters<ProviderStreamSimple>;
  * The gate receives the request options because `options.sessionId` is the only
  * identity available at this boundary — the closure may belong to any session.
  */
-export function guardStream<TOptions extends StreamOptions>(
-	fallback: StreamFunction<Api, TOptions>,
-	evaluate: (model: Model<Api>, options: TOptions | undefined) => QuotaGateResult,
-): StreamFunction<Api, TOptions> {
+export function guardStreamSimple(
+	fallback: ProviderStreamSimple,
+	evaluate: (model: StreamArgs[0], options: StreamArgs[2]) => QuotaGateResult,
+): ProviderStreamSimple {
 	return (model, context, options) => {
 		const decision = evaluate(model, options);
 		if (decision?.blocked) throw new Error(decision.message);
 		return fallback(model, context, options);
 	};
-}
-
-export function guardStreamSimple(
-	fallback: ProviderStreamSimple,
-	evaluate: (model: StreamArgs[0], options: StreamArgs[2]) => QuotaGateResult,
-): ProviderStreamSimple {
-	return guardStream(fallback, evaluate);
 }
