@@ -230,16 +230,20 @@ loading, and pi's complete-provider registration seam
 Built-in quota-source modules loaded by the Quota Providers extension. The
 DevPass source reads LLM Gateway usage and catalog data for an `llmgateway`
 attachment. It reports the monthly window from `billingCycleAnchor` and an
-independent `premium-weekly` limit when the account provides one.
+independent `premium-weekly` limit when the account provides one. The Copilot
+source reads the `github-copilot` account's AI-credit usage and reports its
+calendar-month limit.
 
 **Responsibilities:** provider-specific usage requests, billing-window
-interpretation, and model-to-limit membership mapping
+interpretation, credential loading, and model-to-limit membership mapping
 
 **Dependencies:** Quota Providers (typed source seam), LLM Gateway usage and
-catalog endpoints, `LLMGATEWAY_API_KEY`
+catalog endpoints, GitHub Copilot account-usage endpoint, and
+`LLMGATEWAY_API_KEY`
 
 **Files:**
 - `extensions/quota-providers/impls/devpass-quota.ts`
+- `extensions/quota-providers/impls/copilot.ts`
 
 ### Shared Tool Seam
 

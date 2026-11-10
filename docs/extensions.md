@@ -174,6 +174,15 @@ anchor to calculate the monthly window. When the account reports a premium
 pool, it adds an independently resetting `premium-weekly` snapshot and maps
 premium model IDs from catalog prices.
 
+### Built-in GitHub Copilot quota source
+
+`extensions/quota-providers/impls/copilot.ts` is a quota source for the
+`github-copilot` attachment. Set its `module` to that file in
+`quota-providers.json`. It reads the stored GitHub OAuth login from
+`auth.json`, queries Copilot's account-usage endpoint, and reports AI-credit
+usage as a calendar-month dollar quota. It requires token-based AI-credit
+billing; legacy premium-request billing and Enterprise logins are unsupported.
+
 Quota sources are TypeScript modules. Follow the seam types in
 `extensions/quota-providers/lib/types.ts` when writing one outside this repo.
 
